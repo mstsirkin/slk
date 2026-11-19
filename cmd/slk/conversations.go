@@ -1,6 +1,8 @@
 package main
 
 import (
+	"context"
+
 	"github.com/gammons/slk/internal/core"
 	"github.com/gammons/slk/internal/ui"
 	"github.com/gammons/slk/internal/ui/sidebar"
@@ -174,4 +176,40 @@ func (h *rtmEventHandler) publishConversation(item sidebar.ChannelItem, finderIt
 		Item:       item,
 		FinderItem: finderItem,
 	})
+}
+
+// orgFallbackConversationResolver wraps a grid member workspace's
+// conversation lookup with the same-user org-level session's. A grid
+// conversation can belong to the org workspace while its message
+// frames fan out to every member session (a DM with an org-workspace
+// peer is the case that motivated this): the member token cannot
+// resolve the org's conversation, so without the fallback the sidebar
+// row never appears in the workspace the user is looking at, even
+// though the messages arrive and cache there. The org session answers
+// as this user's own conversation view. org nil (off a grid, no org
+// session connected, or the sibling is another account's credentials)
+// keeps the workspace's own resolver alone.
+func orgFallbackConversationResolver(own, org func(ctx context.Context, channelID string) (*slack.Channel, error)) func(ctx context.Context, channelID string) (*slack.Channel, error) {
+	if org == nil {
+		return own
+	}
+	return func(ctx context.Context, channelID string) (*slack.Channel, error) {
+		ch, err := own(ctx, channelID)
+		if err == nil {
+			return ch, nil
+		}
+		return org(ctx, channelID)
+	}
+}
+
+// conversationResolverFor builds the rtmEventHandler's
+// resolveConversation: the workspace's own conversations.info, wrapped
+// with the same-user org session's when this workspace is a grid
+// member with one connected (see orgFallbackConversationResolver).
+func conversationResolverFor(router *workspaceRouter, wctx *WorkspaceContext) func(ctx context.Context, channelID string) (*slack.Channel, error) {
+	var org func(ctx context.Context, channelID string) (*slack.Channel, error)
+	if client := sameUserOrgClient(router, wctx); client != nil {
+		org = client.GetConversationInfo
+	}
+	return orgFallbackConversationResolver(wctx.Client.GetConversationInfo, org)
 }
