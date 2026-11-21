@@ -1378,7 +1378,7 @@ func run() error {
 				if wctx == nil || wctx.Client == nil {
 					return
 				}
-				ensureWorkspaceThreadSubs(ctx, wctx, db, p.Send)
+				ensureWorkspaceThreadSubs(ctx, wctx, db, p.Send, router)
 			},
 			ThreadLastRead: func(channelID ids.ChannelID, threadTS ids.ThreadTS) string {
 				wctx := router.Active()
@@ -1799,7 +1799,7 @@ func run() error {
 				// subscription sync; the gate inside decides whether a
 				// getView sweep actually runs.
 				ensureThreadSubs: func() {
-					ensureWorkspaceThreadSubs(context.Background(), wctx, db, p.Send)
+					ensureWorkspaceThreadSubs(context.Background(), wctx, db, p.Send, router)
 				},
 				resolveConversation: conversationResolverFor(router, wctx),
 			}
@@ -1863,6 +1863,25 @@ func run() error {
 			// processed after it.
 			wctx.UserNames.NotifyFrom(readySeq, uiNameNotifier(wctx.TeamID, p.Send))
 			wctx.ChannelResolver.nameStore().NotifyFrom(readyChannelSeq, uiChannelNameNotifier(wctx.TeamID, p.Send))
+
+			// A workspace that just connected may be the org-level
+			// session its grid's member workspaces need: a member whose
+			// subscription sync ran before any org session existed
+			// failed with errNoOrgSessionYet (its own token is
+			// team_is_restricted) and unburned its gate, so re-ensure
+			// the members now - the ones still without a list get their
+			// sync, with the org session available this time.
+			if wctx.Client != nil && wctx.Client.EnterpriseID() != "" {
+				for _, sibling := range router.All() {
+					if sibling == wctx || sibling.Client == nil || !sibling.Client.IsGridMember() {
+						continue
+					}
+					if sibling.Client.EnterpriseID() != wctx.Client.EnterpriseID() || sibling.SubscriptionsAvailable {
+						continue
+					}
+					ensureWorkspaceThreadSubs(context.Background(), sibling, db, p.Send, router)
+				}
+			}
 
 			// Live repairs may mutate workspace slices. Start their owner only
 			// after cloning and handing off the startup snapshots above.

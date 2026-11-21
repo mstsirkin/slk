@@ -465,3 +465,104 @@ func TestEnsureThreadSubscriptions_FailureDoesNotNotify(t *testing.T) {
 	default:
 	}
 }
+
+// threadSubscriptionListerFor routes a grid member workspace's
+// subscription sync through the same-user org session when its own
+// lister fails: subscriptions.thread.getView answers member tokens
+// with team_is_restricted, and the list is user-scoped across the
+// grid, so the org session's answer is this workspace's list. Off a
+// grid or without a matching org session, the workspace's own client
+// lister runs alone.
+func TestThreadSubscriptionListerFor(t *testing.T) {
+	member := &WorkspaceContext{TeamID: "T1", Client: slackclient.NewSessionClient("T1", "E1", "U1")}
+	org := &WorkspaceContext{TeamID: "E1", Client: slackclient.NewSessionClient("E1", "E1", "U1")}
+	plain := &WorkspaceContext{TeamID: "T9", Client: slackclient.NewSessionClient("T9", "", "U9")}
+
+	router := newWorkspaceRouter()
+	router.Add(member)
+	// A member without its org session still gets the wrapper; its
+	// orgFn resolves nil while no org session is connected.
+	got := threadSubscriptionListerFor(router, member)
+	noOrg, ok := got.(orgFallbackThreadLister)
+	if !ok || noOrg.orgFn == nil || noOrg.orgFn() != nil {
+		t.Fatalf("a grid member without its org session got a %T; want the wrapper resolving no org", got)
+	}
+	if got := threadSubscriptionListerFor(router, plain); got != threadSubscriptionLister(plain.Client) {
+		t.Fatal("a non-grid workspace did not get its own client's lister")
+	}
+
+	router.Add(org)
+	got = threadSubscriptionListerFor(router, member)
+	fallback, ok := got.(orgFallbackThreadLister)
+	if !ok {
+		t.Fatalf("a grid member with its org session got a %T; want orgFallbackThreadLister", got)
+	}
+	if fallback.own != threadSubscriptionLister(member.Client) || fallback.orgFn() != threadSubscriptionLister(org.Client) {
+		t.Fatal("the fallback lister did not pair the member's own client with the org session's, resolved at list time")
+	}
+}
+
+// orgFallbackThreadLister passes the own lister's success through,
+// falls back to the org session's on its failure, and reports the
+// org session's error when both fail.
+func TestOrgFallbackThreadLister(t *testing.T) {
+	restricted := errors.New("subscriptions.thread.getView: team_is_restricted")
+	orgErr := errors.New("org also failed")
+	ownViews := []slackclient.ThreadSubscriptionView{subView("C1", "1.1", "", "own", "U1", true)}
+	orgViews := []slackclient.ThreadSubscriptionView{subView("C2", "2.2", "", "org", "U1", true)}
+
+	own := &fakeSubscriptions{response: ownViews}
+	org := &fakeSubscriptions{response: orgViews}
+	l := orgFallbackThreadLister{own: own, orgFn: func() threadSubscriptionLister { return org }}
+
+	views, err := l.ListThreadSubscriptions(context.Background())
+	if err != nil || len(views) != 1 || views[0].Subscription.ChannelID != "C1" {
+		t.Fatalf("own-success path = (%v, %v); want the own list untouched", views, err)
+	}
+	if org.calls != 0 {
+		t.Fatal("the org lister ran although the own lister succeeded")
+	}
+
+	own.err = restricted
+	views, err = l.ListThreadSubscriptions(context.Background())
+	if err != nil || len(views) != 1 || views[0].Subscription.ChannelID != "C2" {
+		t.Fatalf("fallback path = (%v, %v); want the org session's list", views, err)
+	}
+
+	org.err = orgErr
+	if _, err := l.ListThreadSubscriptions(context.Background()); err != orgErr {
+		t.Fatalf("both-failed path = %v; want the org session's error", err)
+	}
+}
+
+// A grid member's sync that runs before its org session connects
+// fails with errNoOrgSessionYet, and that failure does not burn the
+// sync gate: the next trigger (the org session's arrival re-ensures
+// the member) is admitted again. A real failure keeps the burn.
+func TestOrgFallbackThreadLister_NoOrgSessionYet(t *testing.T) {
+	restricted := errors.New("subscriptions.thread.getView: team_is_restricted")
+	own := &fakeSubscriptions{err: restricted}
+
+	l := orgFallbackThreadLister{own: own}
+	_, err := l.ListThreadSubscriptions(context.Background())
+	if !errors.Is(err, errNoOrgSessionYet) {
+		t.Fatalf("a member without its org session got %v; want errNoOrgSessionYet", err)
+	}
+
+	gate := &threadSubsGate{window: 30 * time.Minute}
+	if _, ok := gate.tryStart(time.Now()); !ok {
+		t.Fatal("the gate refused the first sync")
+	}
+	// The transient failure unburns (the sync goroutine calls unburn
+	// before its deferred done), and the next trigger is admitted.
+	gate.unburn()
+	gate.done()
+	if _, ok := gate.tryStart(time.Now()); !ok {
+		t.Fatal("the gate refused the retry after an unburned transient failure")
+	}
+	// A sync that completes without unburn keeps the window.
+	gate.done()
+	if _, ok := gate.tryStart(time.Now().Add(time.Second)); ok {
+		t.Fatal("the gate admitted a sync inside the window after done without unburn")
+	}
+}
